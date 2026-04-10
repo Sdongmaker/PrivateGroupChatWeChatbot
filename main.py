@@ -835,10 +835,17 @@ class AnonymousGroupPlugin(Star):
         broadcast_chains = await self._build_broadcast_chains(
             emoji, components, sender_id
         )
+        self._log_behavior(
+            "info",
+            "broadcast_chains_built",
+            sender=sender_id,
+            chain_count=len(broadcast_chains),
+        )
 
-        # 广播给所有其他成员
+        # 广播给所有其他成员（并发发送给不同用户）
         fail_count = 0
         stale_umos = []
+        active_umos = []
         for other_umo in others:
             if not self._is_platform_alive(other_umo):
                 stale_umos.append(other_umo)
@@ -849,18 +856,26 @@ class AnonymousGroupPlugin(Star):
                     target=self._mask_umo(other_umo),
                     platform=self._extract_platform_id(other_umo),
                 )
-                continue
-            try:
-                for chain in broadcast_chains:
-                    mc = MessageChain(chain=list(chain))
-                    await self.context.send_message(other_umo, mc)
-            except Exception as e:
+            else:
+                active_umos.append(other_umo)
+
+        async def _send_to_user(target_umo: str):
+            for idx, chain in enumerate(broadcast_chains):
+                mc = MessageChain(chain=list(chain))
+                await self.context.send_message(target_umo, mc)
+
+        results = await asyncio.gather(
+            *[_send_to_user(umo) for umo in active_umos],
+            return_exceptions=True,
+        )
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
                 self._log_behavior(
                     "error",
                     "broadcast_delivery_failed",
                     sender=sender_id,
-                    target=self._mask_umo(other_umo),
-                    error=str(e),
+                    target=self._mask_umo(active_umos[i]),
+                    error=str(result),
                 )
                 fail_count += 1
 
@@ -945,15 +960,33 @@ class AnonymousGroupPlugin(Star):
         has_media = False
 
         # 每个媒体组件拆成独立消息
+        img_idx = 0
         for comp in components:
             if isinstance(comp, Comp.Image):
                 has_media = True
+                img_idx += 1
                 try:
                     file_path = await comp.convert_to_file_path()
+                    self._log_behavior(
+                        "info",
+                        "image_resolved",
+                        sender=sender_id,
+                        index=img_idx,
+                        method="file",
+                        path=str(file_path),
+                    )
                     chains.append([Comp.Image.fromFileSystem(file_path)])
                 except Exception as e:
                     url = getattr(comp, "url", None) or getattr(comp, "file", "")
                     if url and str(url).startswith("http"):
+                        self._log_behavior(
+                            "info",
+                            "image_resolved",
+                            sender=sender_id,
+                            index=img_idx,
+                            method="url_fallback",
+                            url=str(url)[:120],
+                        )
                         chains.append([Comp.Image.fromURL(str(url))])
                     else:
                         self._log_behavior(
@@ -961,9 +994,11 @@ class AnonymousGroupPlugin(Star):
                             "media_unavailable",
                             sender=sender_id,
                             component="image",
+                            index=img_idx,
                             error=str(e),
                         )
                         chains.append([Comp.Plain("[图片无法转发]")])
+                        
             elif isinstance(comp, Comp.Record):
                 has_media = True
                 try:
