@@ -302,16 +302,16 @@ class WebBridge:
 
         ctx = self.plugin.context
         try:
-            ctx.config["platform"].append(config)
-            ctx.config.save_config()
+            ctx._config["platform"].append(config)
+            ctx._config.save_config()
             await ctx.platform_manager.load_platform(config)
         except Exception as e:
             # rollback
-            ctx.config["platform"] = [
-                p for p in ctx.config["platform"] if p.get("id") != platform_id
+            ctx._config["platform"] = [
+                p for p in ctx._config["platform"] if p.get("id") != platform_id
             ]
             try:
-                ctx.config.save_config()
+                ctx._config.save_config()
             except Exception:
                 pass
             import traceback
@@ -406,11 +406,11 @@ class WebBridge:
                 {"error": f"Failed to terminate platform: {e}"}, status=500
             )
 
-        ctx.config["platform"] = [
-            p for p in ctx.config["platform"] if p.get("id") != platform_id
+        ctx._config["platform"] = [
+            p for p in ctx._config["platform"] if p.get("id") != platform_id
         ]
         try:
-            ctx.config.save_config()
+            ctx._config.save_config()
         except Exception as e:
             self._log("warning", "bot_delete_config_save_failed",
                        platform_id=platform_id, error=str(e))
