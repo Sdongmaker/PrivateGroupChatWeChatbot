@@ -969,16 +969,37 @@ class AnonymousGroupPlugin(Star):
             elif isinstance(comp, Comp.Video):
                 try:
                     file_path = await comp.convert_to_file_path()
+                    self._log_behavior(
+                        "info",
+                        "video_file_resolved",
+                        sender=sender_id,
+                        file_path=str(file_path),
+                    )
                     chain.append(Comp.Video.fromFileSystem(path=file_path))
                 except Exception as e:
-                    self._log_behavior(
-                        "warning",
-                        "media_unavailable",
-                        sender=sender_id,
-                        component="video",
-                        error=str(e),
-                    )
-                    chain.append(Comp.Plain("\n[视频无法转发]"))
+                    # 回退：尝试用 URL
+                    url = getattr(comp, "url", None) or getattr(comp, "file", "")
+                    if url and str(url).startswith("http"):
+                        self._log_behavior(
+                            "info",
+                            "video_url_fallback",
+                            sender=sender_id,
+                            url=str(url)[:120],
+                        )
+                        chain.append(Comp.Video(url=str(url)))
+                    else:
+                        self._log_behavior(
+                            "warning",
+                            "media_unavailable",
+                            sender=sender_id,
+                            component="video",
+                            error=str(e),
+                            raw_attrs={
+                                "url": str(getattr(comp, "url", None)),
+                                "file": str(getattr(comp, "file", None)),
+                            },
+                        )
+                        chain.append(Comp.Plain("\n[视频无法转发]"))
             elif isinstance(comp, Comp.File):
                 try:
                     local = await comp.get_file(allow_return_url=False)
