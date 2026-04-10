@@ -415,11 +415,24 @@ class WebBridge:
             self._log("warning", "bot_delete_config_save_failed",
                        platform_id=platform_id, error=str(e))
 
+        # 清理注册在该平台上的成员
+        all_members = list(self.plugin.registry.get_all_members().keys())
+        removed_members = []
+        for umo in all_members:
+            if umo.startswith(platform_id + ":"):
+                emoji_rm = self.plugin.registry.get_emoji(umo)
+                self.plugin.registry.leave(umo)
+                self.plugin.mode_registry.set_mode(umo, "private")
+                removed_members.append(emoji_rm)
+
         self._managed_bots.remove(platform_id)
-        self._log("info", "bot_deleted", platform_id=platform_id)
+        self._log("info", "bot_deleted", platform_id=platform_id,
+                  members_removed=len(removed_members),
+                  removed_emojis=removed_members)
         return aio_web.json_response({
             "platform_id": platform_id,
             "deleted": True,
+            "members_removed": len(removed_members),
         })
 
     async def _handle_group_send(self, request: aio_web.Request):
@@ -541,6 +554,18 @@ class AnonymousGroupPlugin(Star):
             self._log_behavior(
                 "error", "web_bridge_start_failed", error=str(e)
             )
+
+    def _extract_platform_id(self, umo: str) -> str:
+        """从 unified_msg_origin 中提取平台 ID（第一个 ':' 之前的部分）。"""
+        return umo.split(":", 1)[0] if ":" in umo else umo
+
+    def _is_platform_alive(self, umo: str) -> bool:
+        """检查 UMO 对应的平台是否仍然存在。"""
+        platform_id = self._extract_platform_id(umo)
+        for inst in self.context.platform_manager.platform_insts:
+            if inst.meta().id == platform_id:
+                return True
+        return False
 
     def _mask_umo(self, umo: str) -> str:
         """对用户来源做稳定脱敏，避免在日志中直接暴露原始标识。"""
@@ -813,7 +838,19 @@ class AnonymousGroupPlugin(Star):
 
         # 广播给所有其他成员
         fail_count = 0
+        stale_umos = []
         for other_umo in others:
+            if not self._is_platform_alive(other_umo):
+                stale_umos.append(other_umo)
+                self._log_behavior(
+                    "warning",
+                    "broadcast_skip_dead_platform",
+                    sender=sender_id,
+                    target=self._mask_umo(other_umo),
+                    platform=self._extract_platform_id(other_umo),
+                )
+                fail_count += 1
+                continue
             try:
                 mc = MessageChain(chain=list(broadcast_chain))
                 await self.context.send_message(other_umo, mc)
@@ -827,6 +864,19 @@ class AnonymousGroupPlugin(Star):
                 )
                 fail_count += 1
 
+        # 自动清理已失效平台的成员
+        for stale in stale_umos:
+            emoji_removed = self.registry.get_emoji(stale)
+            self.registry.leave(stale)
+            self.mode_registry.set_mode(stale, "private")
+            self._log_behavior(
+                "info",
+                "auto_remove_stale_member",
+                target=self._mask_umo(stale),
+                emoji=emoji_removed,
+                platform=self._extract_platform_id(stale),
+            )
+
         self._log_behavior(
             "info" if fail_count == 0 else "warning",
             "broadcast",
@@ -835,6 +885,7 @@ class AnonymousGroupPlugin(Star):
             recipients=len(others),
             delivered=len(others) - fail_count,
             failed=fail_count,
+            stale_removed=len(stale_umos),
             content=content_summary,
         )
 
