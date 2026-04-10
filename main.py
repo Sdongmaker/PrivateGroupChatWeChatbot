@@ -849,7 +849,6 @@ class AnonymousGroupPlugin(Star):
                     target=self._mask_umo(other_umo),
                     platform=self._extract_platform_id(other_umo),
                 )
-                fail_count += 1
                 continue
             try:
                 mc = MessageChain(chain=list(broadcast_chain))
@@ -877,13 +876,14 @@ class AnonymousGroupPlugin(Star):
                 platform=self._extract_platform_id(stale),
             )
 
+        active_recipients = len(others) - len(stale_umos)
         self._log_behavior(
             "info" if fail_count == 0 else "warning",
             "broadcast",
             sender=sender_id,
             emoji=emoji,
-            recipients=len(others),
-            delivered=len(others) - fail_count,
+            recipients=active_recipients,
+            delivered=active_recipients - fail_count,
             failed=fail_count,
             stale_removed=len(stale_umos),
             content=content_summary,
@@ -893,11 +893,18 @@ class AnonymousGroupPlugin(Star):
             yield event.plain_result(
                 f"✅ 已自动进入虚拟群聊模式\n"
                 f"你的身份标识: {emoji}\n"
-                f"本条消息已匿名广播给 {len(others)} 人\n"
+                f"本条消息已匿名广播给 {active_recipients} 人\n"
                 f"发送 /leave 可切回私聊模式"
             )
         elif fail_count > 0:
             yield event.plain_result(f"⚠️ 消息已发送，但有 {fail_count} 人未收到")
+        if stale_umos:
+            self._log_behavior(
+                "info",
+                "stale_cleanup_summary",
+                removed=len(stale_umos),
+                remaining=len(self.registry.get_all_members()),
+            )
         event.stop_event()
 
     # ── 内部方法 ─────────────────────────────────────────
