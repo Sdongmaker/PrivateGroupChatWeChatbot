@@ -301,8 +301,8 @@ class WebBridge:
         }
 
         ctx = self.plugin.context
-        ctx.config["platform"].append(config)
         try:
+            ctx.config["platform"].append(config)
             ctx.config.save_config()
             await ctx.platform_manager.load_platform(config)
         except Exception as e:
@@ -314,9 +314,11 @@ class WebBridge:
                 ctx.config.save_config()
             except Exception:
                 pass
-            self._log("error", "bot_create_failed", platform_id=platform_id, error=str(e))
+            import traceback
+            err_detail = traceback.format_exc()
+            self._log("error", "bot_create_failed", platform_id=platform_id, error=err_detail)
             return aio_web.json_response(
-                {"error": f"Platform load failed: {e}"}, status=500
+                {"error": f"Platform load failed: {e}", "detail": err_detail}, status=500
             )
 
         sub = request.get("jwt_sub", "unknown")
