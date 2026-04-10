@@ -1,0 +1,980 @@
+import asyncio
+import json
+import os
+import random
+import stat
+import time
+import hashlib
+
+import jwt as pyjwt
+from aiohttp import web as aio_web
+
+import astrbot.api.message_components as Comp
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api.star import Context, Star, register
+from astrbot.api import logger
+
+EMOJI_POOL = [
+    "🦊", "🐼", "🦁", "🐨", "🐯", "🦄", "🐸", "🐧", "🦋", "🐝",
+    "🦉", "🐬", "🐙", "🦈", "🐢", "🐾", "🦩", "🐻", "🐮", "🐷",
+    "🐰", "🐶", "🐱", "🐵", "🐺", "🦆", "🦅", "🐴", "🦎", "🐘",
+    "🦒", "🦇", "🐿️", "🦔", "🐞", "🦜", "🐡", "🦑", "🐠", "🦨",
+    "🌻", "🌸", "🌺", "🍄", "🌵", "🎃", "⭐", "🌙", "🌈", "❄️",
+]
+
+
+class MemberRegistry:
+    """管理匿名群组成员的注册信息，持久化到 JSON 文件。"""
+
+    def __init__(self, data_path: str):
+        self.data_path = data_path
+        self.members: dict = {}
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.data_path):
+            try:
+                with open(self.data_path, "r", encoding="utf-8") as f:
+                    self.members = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                logger.warning("成员数据文件损坏，将使用空数据")
+                self.members = {}
+
+    def _save(self):
+        os.makedirs(os.path.dirname(self.data_path), exist_ok=True)
+        with open(self.data_path, "w", encoding="utf-8") as f:
+            json.dump(self.members, f, ensure_ascii=False, indent=2)
+
+    def join(self, umo: str) -> str:
+        if umo in self.members:
+            return self.members[umo]["emoji"]
+        used_emojis = {m["emoji"] for m in self.members.values()}
+        available = [e for e in EMOJI_POOL if e not in used_emojis]
+        emoji = random.choice(available) if available else random.choice(EMOJI_POOL)
+        self.members[umo] = {"emoji": emoji, "joined_at": int(time.time())}
+        self._save()
+        return emoji
+
+    def leave(self, umo: str) -> bool:
+        if umo in self.members:
+            del self.members[umo]
+            self._save()
+            return True
+        return False
+
+    def get_emoji(self, umo: str) -> str:
+        return self.members[umo]["emoji"] if umo in self.members else "❓"
+
+    def is_member(self, umo: str) -> bool:
+        return umo in self.members
+
+    def get_all_members(self) -> dict:
+        return self.members
+
+    def get_other_umos(self, umo: str) -> list[str]:
+        return [m for m in self.members if m != umo]
+
+
+class SessionModeRegistry:
+    """管理每个会话的模式：relay 为虚拟群聊，private 为普通私聊。"""
+
+    DEFAULT_MODE = "relay"
+    VALID_MODES = {"relay", "private"}
+
+    def __init__(self, data_path: str):
+        self.data_path = data_path
+        self.modes: dict[str, str] = {}
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.data_path):
+            try:
+                with open(self.data_path, "r", encoding="utf-8") as f:
+                    self.modes = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                logger.warning("模式数据文件损坏，将使用默认模式")
+                self.modes = {}
+
+    def _save(self):
+        os.makedirs(os.path.dirname(self.data_path), exist_ok=True)
+        with open(self.data_path, "w", encoding="utf-8") as f:
+            json.dump(self.modes, f, ensure_ascii=False, indent=2)
+
+    def get_mode(self, umo: str) -> str:
+        mode = self.modes.get(umo, self.DEFAULT_MODE)
+        return mode if mode in self.VALID_MODES else self.DEFAULT_MODE
+
+    def set_mode(self, umo: str, mode: str):
+        normalized = mode if mode in self.VALID_MODES else self.DEFAULT_MODE
+        self.modes[umo] = normalized
+        self._save()
+
+    def is_relay_mode(self, umo: str) -> bool:
+        return self.get_mode(umo) == "relay"
+
+
+class ManagedBotsRegistry:
+    """追踪由 WebBridge API 创建的 bot 实例。"""
+
+    def __init__(self, data_path: str):
+        self.data_path = data_path
+        self.bots: dict = {}
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.data_path):
+            try:
+                with open(self.data_path, "r", encoding="utf-8") as f:
+                    self.bots = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                logger.warning("managed_bots 数据文件损坏，将使用空数据")
+                self.bots = {}
+
+    def _save(self):
+        os.makedirs(os.path.dirname(self.data_path), exist_ok=True)
+        with open(self.data_path, "w", encoding="utf-8") as f:
+            json.dump(self.bots, f, ensure_ascii=False, indent=2)
+
+    def add(self, platform_id: str, created_by: str):
+        self.bots[platform_id] = {
+            "created_at": int(time.time()),
+            "created_by": created_by,
+            "status": "active",
+        }
+        self._save()
+
+    def remove(self, platform_id: str) -> bool:
+        if platform_id in self.bots:
+            del self.bots[platform_id]
+            self._save()
+            return True
+        return False
+
+    def contains(self, platform_id: str) -> bool:
+        return platform_id in self.bots
+
+    def get_all(self) -> dict:
+        return self.bots
+
+
+# ── WebBridge: 独立 HTTP Server ─────────────────────────
+
+
+class WebBridge:
+    """管理 aiohttp HTTP server 的完整生命周期、JWT 认证、API 路由。"""
+
+    VERSION = "1.3.0"
+    SYSTEM_EMOJI = "🤖"
+
+    def __init__(self, plugin, data_dir: str, port: int = 6196, jwt_secret: str = ""):
+        self.plugin = plugin
+        self._data_dir = data_dir
+        self._port = port
+        self._app: aio_web.Application | None = None
+        self._runner: aio_web.AppRunner | None = None
+        self._site: aio_web.TCPSite | None = None
+        self._jwt_secret = jwt_secret if jwt_secret else self._init_jwt_secret()
+        self._managed_bots = ManagedBotsRegistry(
+            os.path.join(data_dir, "managed_bots.json")
+        )
+
+    # ── JWT secret ───────────────────────────────────────
+
+    def _init_jwt_secret(self) -> str:
+        secret_path = os.path.join(self._data_dir, "jwt_secret.txt")
+        if os.path.exists(secret_path):
+            with open(secret_path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        secret = os.urandom(32).hex()
+        with open(secret_path, "w", encoding="utf-8") as f:
+            f.write(secret)
+        try:
+            os.chmod(secret_path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+        logger.info(
+            f"[匿名树洞] WebBridge JWT secret 已生成并保存到 {secret_path} "
+            f"(secret={secret}) — 请复制给外部 Web 项目"
+        )
+        return secret
+
+    # ── Middleware ────────────────────────────────────────
+
+    @aio_web.middleware
+    async def _auth_middleware(self, request: aio_web.Request, handler):
+        if request.path == "/api/health":
+            return await handler(request)
+        if not request.path.startswith("/api/"):
+            return await handler(request)
+
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header:
+            return aio_web.json_response(
+                {"error": "Missing Authorization header"}, status=401
+            )
+        if not auth_header.startswith("Bearer "):
+            return aio_web.json_response(
+                {"error": "Invalid Authorization format"}, status=401
+            )
+
+        token = auth_header.removeprefix("Bearer ").strip()
+        try:
+            payload = pyjwt.decode(
+                token, self._jwt_secret, algorithms=["HS256"],
+                options={"require": ["exp"]},
+            )
+            request["jwt_sub"] = payload.get("sub", "unknown")
+        except pyjwt.ExpiredSignatureError:
+            return aio_web.json_response(
+                {"error": "Token expired"}, status=401
+            )
+        except pyjwt.InvalidTokenError:
+            return aio_web.json_response(
+                {"error": "Invalid token"}, status=401
+            )
+
+        return await handler(request)
+
+    # ── Lifecycle ────────────────────────────────────────
+
+    def _register_routes(self):
+        self._app.router.add_get("/api/health", self._handle_health)
+        self._app.router.add_post("/api/bot/create", self._handle_bot_create)
+        self._app.router.add_get(
+            "/api/bot/{platform_id}/qr", self._handle_bot_qr
+        )
+        self._app.router.add_get("/api/bot/list", self._handle_bot_list)
+        self._app.router.add_delete(
+            "/api/bot/{platform_id}", self._handle_bot_delete
+        )
+        self._app.router.add_post("/api/group/send", self._handle_group_send)
+        self._app.router.add_get(
+            "/api/group/status", self._handle_group_status
+        )
+
+    async def start(self):
+        self._app = aio_web.Application(middlewares=[self._auth_middleware])
+        self._register_routes()
+        self._runner = aio_web.AppRunner(self._app)
+        await self._runner.setup()
+        self._site = aio_web.TCPSite(self._runner, "0.0.0.0", self._port)
+        await self._site.start()
+
+    async def stop(self):
+        if self._site:
+            await self._site.stop()
+        if self._runner:
+            await self._runner.cleanup()
+
+    # ── Helpers ──────────────────────────────────────────
+
+    def _find_platform(self, platform_id: str):
+        for inst in self.plugin.context.platform_manager.platform_insts:
+            if inst.meta().id == platform_id:
+                return inst
+        return None
+
+    def _log(self, level: str, action: str, **fields):
+        self.plugin._log_behavior(level, action, **fields)
+
+    # ── Handlers ─────────────────────────────────────────
+
+    async def _handle_health(self, request: aio_web.Request):
+        return aio_web.json_response({
+            "status": "ok",
+            "version": self.VERSION,
+            "member_count": len(self.plugin.registry.get_all_members()),
+            "managed_bots_count": len(self._managed_bots.get_all()),
+        })
+
+    async def _handle_bot_create(self, request: aio_web.Request):
+        platform_id = f"weixin_oc_ext_{int(time.time())}"
+        config = {
+            "id": platform_id,
+            "type": "weixin_oc",
+            "enable": True,
+            "weixin_oc_bot_type": "3",
+            "weixin_oc_base_url": "https://ilinkai.weixin.qq.com",
+            "weixin_oc_token": "",
+            "weixin_oc_account_id": "",
+            "weixin_oc_qr_poll_interval": 1,
+        }
+
+        ctx = self.plugin.context
+        ctx.config["platform"].append(config)
+        try:
+            ctx.config.save_config()
+            await ctx.platform_manager.load_platform(config)
+        except Exception as e:
+            # rollback
+            ctx.config["platform"] = [
+                p for p in ctx.config["platform"] if p.get("id") != platform_id
+            ]
+            try:
+                ctx.config.save_config()
+            except Exception:
+                pass
+            self._log("error", "bot_create_failed", platform_id=platform_id, error=str(e))
+            return aio_web.json_response(
+                {"error": f"Platform load failed: {e}"}, status=500
+            )
+
+        sub = request.get("jwt_sub", "unknown")
+        self._managed_bots.add(platform_id, sub)
+        self._log("info", "bot_created", platform_id=platform_id, created_by=sub)
+        return aio_web.json_response({
+            "platform_id": platform_id,
+            "status": "qr_pending",
+        })
+
+    async def _handle_bot_qr(self, request: aio_web.Request):
+        platform_id = request.match_info["platform_id"]
+        if not self._managed_bots.contains(platform_id):
+            return aio_web.json_response(
+                {"error": "Bot not found or not managed by this plugin"},
+                status=404,
+            )
+
+        inst = self._find_platform(platform_id)
+        if inst is None:
+            return aio_web.json_response(
+                {"error": "Bot not found or not managed by this plugin"},
+                status=404,
+            )
+
+        stats = inst.get_stats()
+        wx_info = stats.get("weixin_oc", {})
+
+        qr_status = wx_info.get("qr_status")
+        qr_url = wx_info.get("qrcode_img_content")
+        qr_error = wx_info.get("qr_error")
+
+        if qr_status is None and not wx_info.get("configured"):
+            qr_status = "initializing"
+
+        return aio_web.json_response({
+            "platform_id": platform_id,
+            "qr_url": qr_url,
+            "status": qr_status,
+            "error": qr_error,
+        })
+
+    async def _handle_bot_list(self, request: aio_web.Request):
+        bots_data = self._managed_bots.get_all()
+        result = []
+        for pid, info in bots_data.items():
+            inst = self._find_platform(pid)
+            runtime_status = "unknown"
+            qr_status = None
+            configured = False
+            if inst is not None:
+                try:
+                    runtime_status = inst.status.value
+                except Exception:
+                    runtime_status = "unknown"
+                stats = inst.get_stats()
+                wx_info = stats.get("weixin_oc", {})
+                qr_status = wx_info.get("qr_status")
+                configured = bool(wx_info.get("configured", False))
+            result.append({
+                "platform_id": pid,
+                "created_at": info.get("created_at"),
+                "created_by": info.get("created_by"),
+                "runtime_status": runtime_status,
+                "qr_status": qr_status,
+                "configured": configured,
+            })
+        return aio_web.json_response({"bots": result})
+
+    async def _handle_bot_delete(self, request: aio_web.Request):
+        platform_id = request.match_info["platform_id"]
+        if not self._managed_bots.contains(platform_id):
+            return aio_web.json_response(
+                {"error": "Bot not found or not managed by this plugin"},
+                status=404,
+            )
+
+        ctx = self.plugin.context
+        try:
+            await ctx.platform_manager.terminate_platform(platform_id)
+        except Exception as e:
+            self._log("error", "bot_delete_terminate_failed",
+                       platform_id=platform_id, error=str(e))
+            return aio_web.json_response(
+                {"error": f"Failed to terminate platform: {e}"}, status=500
+            )
+
+        ctx.config["platform"] = [
+            p for p in ctx.config["platform"] if p.get("id") != platform_id
+        ]
+        try:
+            ctx.config.save_config()
+        except Exception as e:
+            self._log("warning", "bot_delete_config_save_failed",
+                       platform_id=platform_id, error=str(e))
+
+        self._managed_bots.remove(platform_id)
+        self._log("info", "bot_deleted", platform_id=platform_id)
+        return aio_web.json_response({
+            "platform_id": platform_id,
+            "deleted": True,
+        })
+
+    async def _handle_group_send(self, request: aio_web.Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return aio_web.json_response(
+                {"error": "Invalid JSON body"}, status=400
+            )
+
+        text = (body.get("text") or "").strip()
+        if not text or len(text) > 2000:
+            return aio_web.json_response(
+                {"error": "Text is required and must be 1-2000 characters"},
+                status=400,
+            )
+
+        members = self.plugin.registry.get_all_members()
+
+        delivered = 0
+        failed = 0
+        for umo in members:
+            try:
+                mc = MessageChain(chain=[Comp.Plain(f"{self.SYSTEM_EMOJI} | {text}")])
+                await self.plugin.context.send_message(umo, mc)
+                delivered += 1
+            except Exception as e:
+                failed += 1
+                self._log("error", "system_broadcast_delivery_failed",
+                           target=self.plugin._mask_umo(umo), error=str(e))
+
+        self._log("info", "system_broadcast",
+                   delivered=delivered, failed=failed, total=len(members))
+        return aio_web.json_response({
+            "delivered": delivered,
+            "failed": failed,
+            "total": len(members),
+        })
+
+    async def _handle_group_status(self, request: aio_web.Request):
+        members = self.plugin.registry.get_all_members()
+        member_list = [
+            {"emoji": info["emoji"], "joined_at": info.get("joined_at")}
+            for info in members.values()
+        ]
+
+        managed = self._managed_bots.get_all()
+        running = 0
+        for pid in managed:
+            inst = self._find_platform(pid)
+            if inst is not None:
+                try:
+                    if inst.status.value == "running":
+                        running += 1
+                except Exception:
+                    pass
+
+        return aio_web.json_response({
+            "member_count": len(members),
+            "members": member_list,
+            "managed_bots_total": len(managed),
+            "managed_bots_running": running,
+        })
+
+
+@register(
+    "PrivateGroupChatWeChatbot",
+    "笨笨",
+    "跨微信号匿名群聊插件：给 Bot 发私聊，自动广播给所有成员；支持外部 Web 项目通过 API 接入",
+    "1.3.0",
+    "https://github.com/Sdongmaker/PrivateGroupChatWeChatbot",
+)
+class AnonymousGroupPlugin(Star):
+    LOG_PREFIX = "[匿名树洞]"
+
+    def __init__(self, context: Context, config=None):
+        super().__init__(context)
+        self._config = config
+        data_dir = os.path.join("data", "astrbot_plugin_PrivateGroupChatWeChatbot")
+        os.makedirs(data_dir, exist_ok=True)
+        self.registry = MemberRegistry(os.path.join(data_dir, "members.json"))
+        self.mode_registry = SessionModeRegistry(os.path.join(data_dir, "modes.json"))
+
+        # 从 schema 配置面板读取值
+        cfg_port = 6196
+        cfg_secret = ""
+        if config:
+            cfg_port = config.get("web_bridge_port", 6196)
+            cfg_secret = config.get("jwt_secret", "")
+
+        self.web_bridge = WebBridge(self, data_dir, port=cfg_port, jwt_secret=cfg_secret)
+
+        # 如果面板里 jwt_secret 留空，将自动生成的值回写到配置面板
+        if config and not cfg_secret:
+            config["jwt_secret"] = self.web_bridge._jwt_secret
+            try:
+                config.save_config()
+            except Exception:
+                pass
+
+        self._server_task: asyncio.Task | None = None
+        self._log_behavior(
+            "info",
+            "plugin_loaded",
+            member_count=len(self.registry.get_all_members()),
+        )
+
+    async def initialize(self):
+        """插件激活时启动 WebBridge HTTP server。"""
+        self._server_task = asyncio.create_task(self._run_web_bridge())
+
+    async def _run_web_bridge(self):
+        try:
+            await self.web_bridge.start()
+            self._log_behavior(
+                "info", "web_bridge_started", port=self.web_bridge._port
+            )
+        except Exception as e:
+            self._log_behavior(
+                "error", "web_bridge_start_failed", error=str(e)
+            )
+
+    def _mask_umo(self, umo: str) -> str:
+        """对用户来源做稳定脱敏，避免在日志中直接暴露原始标识。"""
+        digest = hashlib.sha256(umo.encode("utf-8")).hexdigest()[:12]
+        return f"user:{digest}"
+
+    def _summarize_components(
+        self, components: list[Comp.BaseMessageComponent]
+    ) -> dict[str, int]:
+        summary: dict[str, int] = {}
+        for comp in components:
+            component_type = "other"
+            if isinstance(comp, Comp.Plain):
+                if not comp.text.strip():
+                    continue
+                component_type = "text"
+            elif isinstance(comp, Comp.Image):
+                component_type = "image"
+            elif isinstance(comp, Comp.Record):
+                component_type = "record"
+            elif isinstance(comp, Comp.Video):
+                component_type = "video"
+            elif isinstance(comp, Comp.File):
+                component_type = "file"
+            elif isinstance(comp, Comp.Face):
+                component_type = "face"
+            elif isinstance(comp, Comp.Reply):
+                component_type = "reply"
+
+            summary[component_type] = summary.get(component_type, 0) + 1
+        return summary or {"empty": 1}
+
+    def _log_behavior(self, level: str, action: str, **fields):
+        parts = [self.LOG_PREFIX, f"action={action}"]
+        for key, value in fields.items():
+            if value is None:
+                continue
+            rendered = json.dumps(value, ensure_ascii=False, default=str)
+            parts.append(f"{key}={rendered}")
+        message = " ".join(parts)
+
+        if level == "warning":
+            logger.warning(message)
+        elif level == "error":
+            logger.error(message)
+        else:
+            logger.info(message)
+
+    def _mode_label(self, mode: str) -> str:
+        return "虚拟群聊模式" if mode == "relay" else "私聊模式"
+
+    # ── 指令 ──────────────────────────────────────────────
+
+    @filter.command("join", alias={"加入", "加入群组", "群聊模式", "树洞模式"}, priority=10)
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    async def join_group(self, event: AstrMessageEvent):
+        """切换到匿名群聊模式"""
+        umo = event.unified_msg_origin
+        sender_id = self._mask_umo(umo)
+        current_mode = self.mode_registry.get_mode(umo)
+        already_member = self.registry.is_member(umo)
+        self.mode_registry.set_mode(umo, "relay")
+        emoji = self.registry.join(umo)
+        count = len(self.registry.get_all_members())
+
+        if already_member and current_mode == "relay":
+            self._log_behavior(
+                "info",
+                "join_repeat",
+                sender=sender_id,
+                emoji=emoji,
+                member_count=count,
+            )
+            yield event.plain_result(
+                f"ℹ️ 你当前已经处于虚拟群聊模式\n"
+                f"你的身份标识: {emoji}\n"
+                f"当前群组人数: {count}\n\n"
+                f"直接发消息即可匿名群聊\n"
+                f"/leave  切换到私聊模式\n"
+                f"/anon_status  查看当前状态"
+            )
+            event.stop_event()
+            return
+
+        self._log_behavior(
+            "info",
+            "switch_to_relay",
+            sender=sender_id,
+            emoji=emoji,
+            member_count=count,
+        )
+        yield event.plain_result(
+            f"✅ 已切换到虚拟群聊模式\n"
+            f"你的身份标识: {emoji}\n"
+            f"当前群组人数: {count}\n\n"
+            f"现在开始，你发给 Bot 的私聊消息会匿名转发给其他成员\n"
+            f"/leave  切换到私聊模式\n"
+            f"/members  查看成员"
+        )
+        if not already_member:
+            await self._notify_others(
+                umo, f"📢 新成员 {emoji} 加入了群组！（当前 {count} 人）"
+            )
+        event.stop_event()
+
+    @filter.command("leave", alias={"退出", "离开", "私聊模式"}, priority=10)
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    async def leave_group(self, event: AstrMessageEvent):
+        """切换到私聊模式"""
+        umo = event.unified_msg_origin
+        sender_id = self._mask_umo(umo)
+        emoji = self.registry.get_emoji(umo)
+        was_member = self.registry.leave(umo)
+        self.mode_registry.set_mode(umo, "private")
+        count = len(self.registry.get_all_members())
+        self._log_behavior(
+            "info",
+            "switch_to_private",
+            sender=sender_id,
+            emoji=emoji if was_member else None,
+            was_member=was_member,
+            member_count=count,
+        )
+        yield event.plain_result(
+            "🛌 已切换到私聊模式\n"
+            "后续消息将不再进入匿名群聊，而是交给 AstrBot 默认流程处理\n"
+            "发送 /join 可重新回到匿名群聊模式"
+        )
+        if was_member:
+            await self._notify_others(
+                umo, f"📢 成员 {emoji} 离开了群组（当前 {count} 人）"
+            )
+        event.stop_event()
+
+    @filter.command("members", alias={"成员", "成员列表"}, priority=10)
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    async def list_members(self, event: AstrMessageEvent):
+        """查看群组成员列表"""
+        members = self.registry.get_all_members()
+        sender_id = self._mask_umo(event.unified_msg_origin)
+        if not members:
+            self._log_behavior("info", "members_view_empty", sender=sender_id)
+            yield event.plain_result("群组暂无成员，发送 /join 加入")
+            event.stop_event()
+            return
+        umo = event.unified_msg_origin
+        self._log_behavior(
+            "info",
+            "members_view",
+            sender=sender_id,
+            member_count=len(members),
+        )
+        lines = [f"👥 匿名群组成员（{len(members)} 人）：\n"]
+        for m_umo, info in members.items():
+            marker = " ← 你" if m_umo == umo else ""
+            lines.append(f"  {info['emoji']}{marker}")
+        yield event.plain_result("\n".join(lines))
+        event.stop_event()
+
+    @filter.command("anon_status", alias={"树洞状态", "群聊状态", "当前状态"}, priority=10)
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    async def status_cmd(self, event: AstrMessageEvent):
+        """查看当前会话是虚拟群聊模式还是私聊模式"""
+        umo = event.unified_msg_origin
+        mode = self.mode_registry.get_mode(umo)
+        is_member = self.registry.is_member(umo)
+        emoji = self.registry.get_emoji(umo) if is_member else "未分配"
+        count = len(self.registry.get_all_members())
+        self._log_behavior(
+            "info",
+            "status_view",
+            sender=self._mask_umo(umo),
+            mode=mode,
+            member_count=count,
+        )
+        yield event.plain_result(
+            f"当前模式: {self._mode_label(mode)}\n"
+            f"是否在匿名群组中: {'是' if is_member else '否'}\n"
+            f"身份标识: {emoji}\n"
+            f"当前群组人数: {count}\n\n"
+            f"/join 切换到虚拟群聊模式\n"
+            f"/leave 切换到私聊模式"
+        )
+        event.stop_event()
+
+    @filter.command("anon_help", alias={"树洞帮助"}, priority=10)
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    async def help_cmd(self, event: AstrMessageEvent):
+        """查看匿名群组帮助"""
+        self._log_behavior(
+            "info",
+            "help_view",
+            sender=self._mask_umo(event.unified_msg_origin),
+        )
+        yield event.plain_result(
+            "🌲 匿名树洞 使用指南\n\n"
+            "默认模式：虚拟群聊模式\n"
+            "首次私聊发送普通消息时，会自动加入匿名群组并中转\n\n"
+            "/join — 切换到虚拟群聊模式\n"
+            "/leave — 切换到私聊模式\n"
+            "/members — 查看成员列表\n"
+            "/anon_status — 查看当前模式\n"
+            "/anon_help — 查看本帮助\n\n"
+            "处于虚拟群聊模式时，私聊消息会匿名广播给其他成员，默认不走 LLM。\n"
+            "切换到私聊模式后，消息会回到 AstrBot 默认处理流程。\n"
+            "支持文字、图片、语音、视频、文件。"
+        )
+        event.stop_event()
+
+    # ── 消息广播 ─────────────────────────────────────────
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    async def on_private_message(self, event: AstrMessageEvent):
+        """监听私聊消息并广播给匿名群组其他成员"""
+        umo = event.unified_msg_origin
+        if not self.mode_registry.is_relay_mode(umo):
+            return
+        # 跳过指令消息（保险起见）
+        msg_str = (event.message_str or "").strip()
+        if msg_str.startswith("/"):
+            return
+
+        sender_id = self._mask_umo(umo)
+        auto_joined = False
+        if not self.registry.is_member(umo):
+            auto_joined = True
+            emoji = self.registry.join(umo)
+            count = len(self.registry.get_all_members())
+            self._log_behavior(
+                "info",
+                "auto_join",
+                sender=sender_id,
+                emoji=emoji,
+                member_count=count,
+            )
+            await self._notify_others(
+                umo, f"📢 新成员 {emoji} 加入了群组！（当前 {count} 人）"
+            )
+        else:
+            emoji = self.registry.get_emoji(umo)
+
+        components = event.get_messages()
+        content_summary = self._summarize_components(components)
+        others = self.registry.get_other_umos(umo)
+        if not others:
+            self._log_behavior(
+                "warning",
+                "broadcast_skipped",
+                sender=sender_id,
+                emoji=emoji,
+                reason="no_receivers",
+                content=content_summary,
+            )
+            if auto_joined:
+                yield event.plain_result(
+                    f"✅ 已自动进入虚拟群聊模式\n"
+                    f"你的身份标识: {emoji}\n"
+                    f"当前群组中只有你一人，等待其他成员加入吧～\n"
+                    f"发送 /leave 可切回私聊模式"
+                )
+            else:
+                yield event.plain_result("群组中只有你一人，等待其他成员加入吧～")
+            event.stop_event()
+            return
+
+        # 构建广播消息链
+        broadcast_chain = await self._build_broadcast_chain(
+            emoji, components, sender_id
+        )
+
+        # 广播给所有其他成员
+        fail_count = 0
+        for other_umo in others:
+            try:
+                mc = MessageChain(chain=list(broadcast_chain))
+                await self.context.send_message(other_umo, mc)
+            except Exception as e:
+                self._log_behavior(
+                    "error",
+                    "broadcast_delivery_failed",
+                    sender=sender_id,
+                    target=self._mask_umo(other_umo),
+                    error=str(e),
+                )
+                fail_count += 1
+
+        self._log_behavior(
+            "info" if fail_count == 0 else "warning",
+            "broadcast",
+            sender=sender_id,
+            emoji=emoji,
+            recipients=len(others),
+            delivered=len(others) - fail_count,
+            failed=fail_count,
+            content=content_summary,
+        )
+
+        if auto_joined and fail_count == 0:
+            yield event.plain_result(
+                f"✅ 已自动进入虚拟群聊模式\n"
+                f"你的身份标识: {emoji}\n"
+                f"本条消息已匿名广播给 {len(others)} 人\n"
+                f"发送 /leave 可切回私聊模式"
+            )
+        elif fail_count > 0:
+            yield event.plain_result(f"⚠️ 消息已发送，但有 {fail_count} 人未收到")
+        event.stop_event()
+
+    # ── 内部方法 ─────────────────────────────────────────
+
+    async def _build_broadcast_chain(
+        self,
+        emoji: str,
+        components: list[Comp.BaseMessageComponent],
+        sender_id: str,
+    ) -> list[Comp.BaseMessageComponent]:
+        """根据收到的消息构建带 emoji 前缀的广播消息链。"""
+        chain: list[Comp.BaseMessageComponent] = []
+
+        # 检查是否有引用回复
+        reply_prefix = ""
+        for comp in components:
+            if isinstance(comp, Comp.Reply):
+                reply_prefix = "[回复消息] "
+                break
+
+        # 收集文本
+        text_parts: list[str] = []
+        for comp in components:
+            if isinstance(comp, Comp.Plain):
+                t = comp.text.strip()
+                if t:
+                    text_parts.append(t)
+
+        # 添加 emoji 前缀 + 文本
+        prefix = f"{emoji} | {reply_prefix}"
+        if text_parts:
+            chain.append(Comp.Plain(f"{prefix}{' '.join(text_parts)}"))
+        else:
+            chain.append(Comp.Plain(prefix))
+
+        # 添加多媒体组件
+        for comp in components:
+            if isinstance(comp, Comp.Image):
+                try:
+                    file_path = await comp.convert_to_file_path()
+                    chain.append(Comp.Image.fromFileSystem(file_path))
+                except Exception as e:
+                    # 回退：尝试用 URL
+                    url = getattr(comp, "url", None) or getattr(comp, "file", "")
+                    if url and str(url).startswith("http"):
+                        chain.append(Comp.Image.fromURL(str(url)))
+                    else:
+                        self._log_behavior(
+                            "warning",
+                            "media_unavailable",
+                            sender=sender_id,
+                            component="image",
+                            error=str(e),
+                        )
+                        chain.append(Comp.Plain("\n[图片无法转发]"))
+            elif isinstance(comp, Comp.Record):
+                try:
+                    file_path = await comp.convert_to_file_path()
+                    chain.append(Comp.Record(file=file_path, url=file_path))
+                except Exception as e:
+                    self._log_behavior(
+                        "warning",
+                        "media_unavailable",
+                        sender=sender_id,
+                        component="record",
+                        error=str(e),
+                    )
+                    chain.append(Comp.Plain("\n[语音无法转发]"))
+            elif isinstance(comp, Comp.Video):
+                try:
+                    file_path = await comp.convert_to_file_path()
+                    chain.append(Comp.Video.fromFileSystem(path=file_path))
+                except Exception as e:
+                    self._log_behavior(
+                        "warning",
+                        "media_unavailable",
+                        sender=sender_id,
+                        component="video",
+                        error=str(e),
+                    )
+                    chain.append(Comp.Plain("\n[视频无法转发]"))
+            elif isinstance(comp, Comp.File):
+                try:
+                    local = await comp.get_file(allow_return_url=False)
+                    name = getattr(comp, "name", "file")
+                    chain.append(Comp.File(name=name, file=local))
+                except Exception as e:
+                    self._log_behavior(
+                        "warning",
+                        "media_unavailable",
+                        sender=sender_id,
+                        component="file",
+                        error=str(e),
+                    )
+                    chain.append(Comp.Plain(f"\n[文件无法转发]"))
+            elif isinstance(comp, Comp.Face):
+                chain.append(Comp.Plain("[表情]"))
+
+        # 如果整条消息链只有 emoji 前缀、没有任何实质内容
+        if len(chain) == 1 and not text_parts:
+            chain[0] = Comp.Plain(f"{prefix}[表情]")
+
+        return chain
+
+    async def _notify_others(self, sender_umo: str, text: str):
+        """向除 sender 外的所有成员发送通知消息。"""
+        others = self.registry.get_other_umos(sender_umo)
+        sender_id = self._mask_umo(sender_umo)
+        for other_umo in others:
+            try:
+                mc = MessageChain(chain=[Comp.Plain(text)])
+                await self.context.send_message(other_umo, mc)
+            except Exception as e:
+                self._log_behavior(
+                    "error",
+                    "notification_failed",
+                    sender=sender_id,
+                    target=self._mask_umo(other_umo),
+                    error=str(e),
+                )
+
+    async def terminate(self):
+        """插件卸载时的清理。"""
+        if self.web_bridge:
+            await self.web_bridge.stop()
+            self._log_behavior("info", "web_bridge_stopped")
+        if self._server_task and not self._server_task.done():
+            self._server_task.cancel()
+        self._log_behavior(
+            "info",
+            "plugin_unloaded",
+            member_count=len(self.registry.get_all_members()),
+        )

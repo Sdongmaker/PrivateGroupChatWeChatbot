@@ -1,0 +1,12 @@
+{
+  "jwt_secret": {
+    "description": "外部 Web 项目对接时使用的 JWT 密钥（留空则自动生成）",
+    "type": "string",
+    "default": ""
+  },
+  "web_bridge_port": {
+    "description": "插件独立 HTTP 服务的监听端口（修改后需重载插件生效）",
+    "type": "int",
+    "default": 6196
+  }
+}

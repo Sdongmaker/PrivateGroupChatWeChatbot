@@ -1,0 +1,8 @@
+name: astrbot_plugin_PrivateGroupChatWeChatbot
+display_name: 匿名树洞
+desc: 跨微信号匿名群聊——默认接管私聊并匿名中转，支持切换回普通私聊模式，支持外部 Web 项目通过 API 接入，并将行为日志写入 AstrBot WebUI
+version: v1.3.0
+author: 笨笨
+repo: https://github.com/Sdongmaker/PrivateGroupChatWeChatbot
+pip_dependencies:
+  - PyJWT>=2.0.0
