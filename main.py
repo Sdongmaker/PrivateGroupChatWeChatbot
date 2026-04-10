@@ -831,8 +831,8 @@ class AnonymousGroupPlugin(Star):
             event.stop_event()
             return
 
-        # 构建广播消息链
-        broadcast_chain = await self._build_broadcast_chain(
+        # 构建广播消息链列表（文字一条，每个媒体各一条）
+        broadcast_chains = await self._build_broadcast_chains(
             emoji, components, sender_id
         )
 
@@ -851,8 +851,9 @@ class AnonymousGroupPlugin(Star):
                 )
                 continue
             try:
-                mc = MessageChain(chain=list(broadcast_chain))
-                await self.context.send_message(other_umo, mc)
+                for chain in broadcast_chains:
+                    mc = MessageChain(chain=list(chain))
+                    await self.context.send_message(other_umo, mc)
             except Exception as e:
                 self._log_behavior(
                     "error",
@@ -909,14 +910,14 @@ class AnonymousGroupPlugin(Star):
 
     # ── 内部方法 ─────────────────────────────────────────
 
-    async def _build_broadcast_chain(
+    async def _build_broadcast_chains(
         self,
         emoji: str,
         components: list[Comp.BaseMessageComponent],
         sender_id: str,
-    ) -> list[Comp.BaseMessageComponent]:
-        """根据收到的消息构建带 emoji 前缀的广播消息链。"""
-        chain: list[Comp.BaseMessageComponent] = []
+    ) -> list[list[Comp.BaseMessageComponent]]:
+        """根据收到的消息构建广播消息链列表：文字一条，每个媒体各一条。"""
+        chains: list[list[Comp.BaseMessageComponent]] = []
 
         # 检查是否有引用回复
         reply_prefix = ""
@@ -933,24 +934,27 @@ class AnonymousGroupPlugin(Star):
                 if t:
                     text_parts.append(t)
 
-        # 添加 emoji 前缀 + 文本
+        # 第一条：emoji 前缀 + 文本
         prefix = f"{emoji} | {reply_prefix}"
         if text_parts:
-            chain.append(Comp.Plain(f"{prefix}{' '.join(text_parts)}"))
+            chains.append([Comp.Plain(f"{prefix}{' '.join(text_parts)}")])
         else:
-            chain.append(Comp.Plain(prefix))
+            # 没有文本时先占位，后面可能改写
+            chains.append([Comp.Plain(prefix)])
 
-        # 添加多媒体组件
+        has_media = False
+
+        # 每个媒体组件拆成独立消息
         for comp in components:
             if isinstance(comp, Comp.Image):
+                has_media = True
                 try:
                     file_path = await comp.convert_to_file_path()
-                    chain.append(Comp.Image.fromFileSystem(file_path))
+                    chains.append([Comp.Image.fromFileSystem(file_path)])
                 except Exception as e:
-                    # 回退：尝试用 URL
                     url = getattr(comp, "url", None) or getattr(comp, "file", "")
                     if url and str(url).startswith("http"):
-                        chain.append(Comp.Image.fromURL(str(url)))
+                        chains.append([Comp.Image.fromURL(str(url))])
                     else:
                         self._log_behavior(
                             "warning",
@@ -959,11 +963,12 @@ class AnonymousGroupPlugin(Star):
                             component="image",
                             error=str(e),
                         )
-                        chain.append(Comp.Plain("\n[图片无法转发]"))
+                        chains.append([Comp.Plain("[图片无法转发]")])
             elif isinstance(comp, Comp.Record):
+                has_media = True
                 try:
                     file_path = await comp.convert_to_file_path()
-                    chain.append(Comp.Record(file=file_path, url=file_path))
+                    chains.append([Comp.Record(file=file_path, url=file_path)])
                 except Exception as e:
                     self._log_behavior(
                         "warning",
@@ -972,8 +977,9 @@ class AnonymousGroupPlugin(Star):
                         component="record",
                         error=str(e),
                     )
-                    chain.append(Comp.Plain("\n[语音无法转发]"))
+                    chains.append([Comp.Plain("[语音无法转发]")])
             elif isinstance(comp, Comp.Video):
+                has_media = True
                 try:
                     file_path = await comp.convert_to_file_path()
                     self._log_behavior(
@@ -982,9 +988,8 @@ class AnonymousGroupPlugin(Star):
                         sender=sender_id,
                         file_path=str(file_path),
                     )
-                    chain.append(Comp.Video.fromFileSystem(path=file_path))
+                    chains.append([Comp.Video.fromFileSystem(path=file_path)])
                 except Exception as e:
-                    # 回退：尝试用 URL
                     url = getattr(comp, "url", None) or getattr(comp, "file", "")
                     if url and str(url).startswith("http"):
                         self._log_behavior(
@@ -993,7 +998,7 @@ class AnonymousGroupPlugin(Star):
                             sender=sender_id,
                             url=str(url)[:120],
                         )
-                        chain.append(Comp.Video(url=str(url)))
+                        chains.append([Comp.Video(url=str(url))])
                     else:
                         self._log_behavior(
                             "warning",
@@ -1006,12 +1011,13 @@ class AnonymousGroupPlugin(Star):
                                 "file": str(getattr(comp, "file", None)),
                             },
                         )
-                        chain.append(Comp.Plain("\n[视频无法转发]"))
+                        chains.append([Comp.Plain("[视频无法转发]")])
             elif isinstance(comp, Comp.File):
+                has_media = True
                 try:
                     local = await comp.get_file(allow_return_url=False)
                     name = getattr(comp, "name", "file")
-                    chain.append(Comp.File(name=name, file=local))
+                    chains.append([Comp.File(name=name, file=local)])
                 except Exception as e:
                     self._log_behavior(
                         "warning",
@@ -1020,15 +1026,15 @@ class AnonymousGroupPlugin(Star):
                         component="file",
                         error=str(e),
                     )
-                    chain.append(Comp.Plain(f"\n[文件无法转发]"))
+                    chains.append([Comp.Plain("[文件无法转发]")])
             elif isinstance(comp, Comp.Face):
-                chain.append(Comp.Plain("[表情]"))
+                has_media = True
 
-        # 如果整条消息链只有 emoji 前缀、没有任何实质内容
-        if len(chain) == 1 and not text_parts:
-            chain[0] = Comp.Plain(f"{prefix}[表情]")
+        # 如果没有文本也没有媒体（纯表情等），改写占位文本
+        if not text_parts and not has_media:
+            chains[0] = [Comp.Plain(f"{prefix}[表情]")]
 
-        return chain
+        return chains
 
     async def _notify_others(self, sender_umo: str, text: str):
         """向除 sender 外的所有成员发送通知消息。"""
