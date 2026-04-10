@@ -860,9 +860,34 @@ class AnonymousGroupPlugin(Star):
                 active_umos.append(other_umo)
 
         async def _send_to_user(target_umo: str):
+            target_id = self._mask_umo(target_umo)
+            platform = self._extract_platform_id(target_umo)
             for idx, chain in enumerate(broadcast_chains):
-                mc = MessageChain(chain=list(chain))
-                await self.context.send_message(target_umo, mc)
+                try:
+                    mc = MessageChain(chain=list(chain))
+                    await self.context.send_message(target_umo, mc)
+                    self._log_behavior(
+                        "info",
+                        "chain_sent",
+                        target=target_id,
+                        platform=platform,
+                        index=idx + 1,
+                        total=len(broadcast_chains),
+                    )
+                except Exception as e:
+                    self._log_behavior(
+                        "error",
+                        "chain_send_failed",
+                        target=target_id,
+                        platform=platform,
+                        index=idx + 1,
+                        total=len(broadcast_chains),
+                        error=str(e),
+                    )
+                    raise
+                # 微信平台对同一用户连续发送有频率限制，加延迟避免丢消息
+                if "weixin" in platform and idx < len(broadcast_chains) - 1:
+                    await asyncio.sleep(1.0)
 
         results = await asyncio.gather(
             *[_send_to_user(umo) for umo in active_umos],
