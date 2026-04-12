@@ -8,5 +8,10 @@
     "description": "插件独立 HTTP 服务的监听端口（修改后需重载插件生效）",
     "type": "int",
     "default": 6196
+  },
+  "group_push_targets": {
+    "description": "群聊推送目标，格式：平台ID:群号（多个用英文逗号分隔）。例如：default:809234679,我的qq机器人:123456。匿名消息广播时会同步推送到这些群聊中。",
+    "type": "string",
+    "default": ""
   }
 }

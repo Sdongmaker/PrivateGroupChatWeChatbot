@@ -2,12 +2,19 @@ import asyncio
 import json
 import os
 import random
+import shutil
 import stat
 import time
 import hashlib
 
 import jwt as pyjwt
 from aiohttp import web as aio_web
+
+try:
+    from PIL import Image as PILImage
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 import astrbot.api.message_components as Comp
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
@@ -502,7 +509,7 @@ class WebBridge:
     "PrivateGroupChatWeChatbot",
     "笨笨",
     "跨微信号匿名群聊插件：给 Bot 发私聊，自动广播给所有成员；支持外部 Web 项目通过 API 接入",
-    "1.3.0",
+    "1.4.0",
     "https://github.com/Sdongmaker/PrivateGroupChatWeChatbot",
 )
 class AnonymousGroupPlugin(Star):
@@ -519,9 +526,12 @@ class AnonymousGroupPlugin(Star):
         # 从 schema 配置面板读取值
         cfg_port = 6196
         cfg_secret = ""
+        self._group_push_targets: list[dict] = []
         if config:
             cfg_port = config.get("web_bridge_port", 6196)
             cfg_secret = config.get("jwt_secret", "")
+            raw_targets = config.get("group_push_targets", "")
+            self._group_push_targets = self._parse_group_push_targets(raw_targets)
 
         self.web_bridge = WebBridge(self, data_dir, port=cfg_port, jwt_secret=cfg_secret)
 
@@ -554,6 +564,29 @@ class AnonymousGroupPlugin(Star):
             self._log_behavior(
                 "error", "web_bridge_start_failed", error=str(e)
             )
+
+    @staticmethod
+    def _parse_group_push_targets(raw: str) -> list[dict]:
+        """解析群推送配置，格式: platform_id:group_id,platform_id:group_id,..."""
+        targets = []
+        if not raw or not raw.strip():
+            return targets
+        for item in raw.split(","):
+            item = item.strip()
+            if ":" not in item:
+                continue
+            platform_id, group_id = item.split(":", 1)
+            platform_id, group_id = platform_id.strip(), group_id.strip()
+            if platform_id and group_id:
+                targets.append({"platform_id": platform_id, "group_id": group_id})
+        return targets
+
+    def _get_platform_adapter_name(self, platform_id: str) -> str:
+        """获取平台适配器类型名，如 'aiocqhttp'、'telegram' 等。"""
+        for inst in self.context.platform_manager.platform_insts:
+            if inst.meta().id == platform_id:
+                return inst.meta().name
+        return "unknown"
 
     def _extract_platform_id(self, umo: str) -> str:
         """从 unified_msg_origin 中提取平台 ID（第一个 ':' 之前的部分）。"""
@@ -904,6 +937,43 @@ class AnonymousGroupPlugin(Star):
                 )
                 fail_count += 1
 
+        # 群聊推送：将广播消息同步推送到配置的群聊
+        group_push_ok = 0
+        group_push_fail = 0
+        for target in self._group_push_targets:
+            group_umo = f"{target['platform_id']}:GroupMessage:{target['group_id']}"
+            try:
+                for idx, chain in enumerate(broadcast_chains):
+                    mc = MessageChain(chain=list(chain))
+                    await self.context.send_message(group_umo, mc)
+                group_push_ok += 1
+                self._log_behavior(
+                    "info",
+                    "group_push_sent",
+                    sender=sender_id,
+                    platform=target["platform_id"],
+                    group_id=target["group_id"],
+                )
+            except Exception as e:
+                group_push_fail += 1
+                self._log_behavior(
+                    "error",
+                    "group_push_failed",
+                    sender=sender_id,
+                    platform=target["platform_id"],
+                    group_id=target["group_id"],
+                    error=str(e),
+                )
+        if self._group_push_targets:
+            self._log_behavior(
+                "info" if group_push_fail == 0 else "warning",
+                "group_push_summary",
+                sender=sender_id,
+                total=len(self._group_push_targets),
+                ok=group_push_ok,
+                failed=group_push_fail,
+            )
+
         # 自动清理已失效平台的成员
         for stale in stale_umos:
             emoji_removed = self.registry.get_emoji(stale)
@@ -992,6 +1062,8 @@ class AnonymousGroupPlugin(Star):
                 img_idx += 1
                 try:
                     file_path = await comp.convert_to_file_path()
+                    # WebP 贴纸转换为 PNG（兼容不支持 WebP 的平台）
+                    file_path = self._convert_webp_if_needed(file_path, sender_id, img_idx)
                     self._log_behavior(
                         "info",
                         "image_resolved",
@@ -1042,6 +1114,8 @@ class AnonymousGroupPlugin(Star):
                 has_media = True
                 try:
                     file_path = await comp.convert_to_file_path()
+                    # 确保视频文件有 .mp4 扩展名（NapCat 等 OB11 实现要求）
+                    file_path = self._ensure_video_extension(file_path, sender_id)
                     self._log_behavior(
                         "info",
                         "video_file_resolved",
@@ -1050,28 +1124,35 @@ class AnonymousGroupPlugin(Star):
                     )
                     chains.append([Comp.Video.fromFileSystem(path=file_path)])
                 except Exception as e:
-                    url = getattr(comp, "url", None) or getattr(comp, "file", "")
-                    if url and str(url).startswith("http"):
-                        self._log_behavior(
-                            "info",
-                            "video_url_fallback",
-                            sender=sender_id,
-                            url=str(url)[:120],
-                        )
-                        chains.append([Comp.Video(url=str(url))])
+                    # 尝试在 AstrBot temp 目录搜索 OB11 裸文件名
+                    resolved = self._try_resolve_ob11_video(
+                        getattr(comp, "file", ""), sender_id
+                    )
+                    if resolved:
+                        chains.append([Comp.Video.fromFileSystem(path=resolved)])
                     else:
-                        self._log_behavior(
-                            "warning",
-                            "media_unavailable",
-                            sender=sender_id,
-                            component="video",
-                            error=str(e),
-                            raw_attrs={
-                                "url": str(getattr(comp, "url", None)),
-                                "file": str(getattr(comp, "file", None)),
-                            },
-                        )
-                        chains.append([Comp.Plain("[视频无法转发]")])
+                        url = getattr(comp, "url", None) or getattr(comp, "file", "")
+                        if url and str(url).startswith("http"):
+                            self._log_behavior(
+                                "info",
+                                "video_url_fallback",
+                                sender=sender_id,
+                                url=str(url)[:120],
+                            )
+                            chains.append([Comp.Video(url=str(url))])
+                        else:
+                            self._log_behavior(
+                                "warning",
+                                "media_unavailable",
+                                sender=sender_id,
+                                component="video",
+                                error=str(e),
+                                raw_attrs={
+                                    "url": str(getattr(comp, "url", None)),
+                                    "file": str(getattr(comp, "file", None)),
+                                },
+                            )
+                            chains.append([Comp.Plain("[视频无法转发]")])
             elif isinstance(comp, Comp.File):
                 has_media = True
                 try:
@@ -1095,6 +1176,104 @@ class AnonymousGroupPlugin(Star):
             chains[0] = [Comp.Plain(f"{prefix}[表情]")]
 
         return chains
+
+    def _ensure_video_extension(self, file_path: str, sender_id: str) -> str:
+        """确保视频文件路径有 .mp4 扩展名（NapCat 等 OB11 实现要求）。"""
+        file_path = os.path.abspath(file_path)
+        if os.path.splitext(file_path)[1].lower() in (".mp4", ".avi", ".mkv", ".mov", ".flv"):
+            return file_path
+        dest = file_path + ".mp4"
+        try:
+            shutil.copy2(file_path, dest)
+            self._log_behavior(
+                "info",
+                "video_ext_fixed",
+                sender=sender_id,
+                original=file_path,
+                renamed=dest,
+            )
+            return dest
+        except Exception as e:
+            self._log_behavior(
+                "warning",
+                "video_ext_fix_failed",
+                sender=sender_id,
+                error=str(e),
+            )
+            return file_path
+
+    def _try_resolve_ob11_video(self, raw_file: str, sender_id: str) -> str | None:
+        """尝试在 AstrBot temp 目录下查找 OB11 传来的裸文件名视频。"""
+        if not raw_file or raw_file.startswith("http") or raw_file.startswith("file:///"):
+            return None
+        # 尝试在常见 temp 目录搜索
+        search_dirs = [
+            os.path.join("data", "temp"),
+            "/tmp",
+        ]
+        basename = os.path.basename(raw_file)
+        for d in search_dirs:
+            candidate = os.path.join(d, basename)
+            if os.path.isfile(candidate):
+                resolved = os.path.abspath(candidate)
+                resolved = self._ensure_video_extension(resolved, sender_id)
+                self._log_behavior(
+                    "info",
+                    "video_ob11_resolved",
+                    sender=sender_id,
+                    raw=raw_file,
+                    resolved=resolved,
+                )
+                return resolved
+        self._log_behavior(
+            "warning",
+            "video_ob11_not_found",
+            sender=sender_id,
+            raw=raw_file,
+            searched=search_dirs,
+        )
+        return None
+
+    def _convert_webp_if_needed(
+        self, file_path: str, sender_id: str, img_idx: int
+    ) -> str:
+        """如果图片是 WebP 格式，转换为 PNG（兼容不支持 WebP 的平台如 QQ）。"""
+        if not HAS_PIL:
+            return file_path
+        try:
+            is_webp = False
+            # 先检查扩展名
+            if file_path.lower().endswith(".webp"):
+                is_webp = True
+            else:
+                # 检查文件头 (RIFF....WEBP)
+                with open(file_path, "rb") as f:
+                    header = f.read(12)
+                if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+                    is_webp = True
+            if not is_webp:
+                return file_path
+            png_path = os.path.splitext(file_path)[0] + ".png"
+            with PILImage.open(file_path) as img:
+                img.save(png_path, "PNG")
+            self._log_behavior(
+                "info",
+                "webp_converted",
+                sender=sender_id,
+                index=img_idx,
+                original=file_path,
+                converted=png_path,
+            )
+            return png_path
+        except Exception as e:
+            self._log_behavior(
+                "warning",
+                "webp_convert_failed",
+                sender=sender_id,
+                index=img_idx,
+                error=str(e),
+            )
+            return file_path
 
     async def _notify_others(self, sender_umo: str, text: str):
         """向除 sender 外的所有成员发送通知消息。"""
