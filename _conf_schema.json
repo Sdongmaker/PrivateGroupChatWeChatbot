@@ -9,6 +9,11 @@
     "type": "int",
     "default": 6196
   },
+  "video_serve_base_url": {
+    "description": "视频中转 HTTP 服务地址。AstrBot 和 NapCat 分容器部署时必须配置，格式：http://astrbot容器主机名:web_bridge_port（如 http://astrbot:6196）。不配置则跨容器视频中转可能失败。",
+    "type": "string",
+    "default": ""
+  },
   "group_push_targets": {
     "description": "群聊推送目标，格式：平台ID:群号（多个用英文逗号分隔）。例如：default:809234679,我的qq机器人:123456。匿名消息广播时会同步推送到这些群聊中。",
     "type": "string",

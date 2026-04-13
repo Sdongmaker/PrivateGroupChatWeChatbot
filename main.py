@@ -15,6 +15,17 @@ try:
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
+    # 尝试自动安装
+    try:
+        import subprocess, sys
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "Pillow>=9.0.0", "-q"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        from PIL import Image as PILImage
+        HAS_PIL = True
+    except Exception:
+        pass
 
 import astrbot.api.message_components as Comp
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
@@ -170,13 +181,15 @@ class ManagedBotsRegistry:
 class WebBridge:
     """管理 aiohttp HTTP server 的完整生命周期、JWT 认证、API 路由。"""
 
-    VERSION = "1.3.0"
+    VERSION = "1.4.0"
     SYSTEM_EMOJI = "🤖"
 
-    def __init__(self, plugin, data_dir: str, port: int = 6196, jwt_secret: str = ""):
+    def __init__(self, plugin, data_dir: str, port: int = 6196, jwt_secret: str = "",
+                 video_serve_base_url: str = ""):
         self.plugin = plugin
         self._data_dir = data_dir
         self._port = port
+        self._video_serve_base_url = video_serve_base_url.rstrip("/") if video_serve_base_url else ""
         self._app: aio_web.Application | None = None
         self._runner: aio_web.AppRunner | None = None
         self._site: aio_web.TCPSite | None = None
@@ -210,6 +223,8 @@ class WebBridge:
     @aio_web.middleware
     async def _auth_middleware(self, request: aio_web.Request, handler):
         if request.path == "/api/health":
+            return await handler(request)
+        if request.path.startswith("/temp/"):
             return await handler(request)
         if not request.path.startswith("/api/"):
             return await handler(request)
@@ -258,6 +273,7 @@ class WebBridge:
         self._app.router.add_get(
             "/api/group/status", self._handle_group_status
         )
+        self._app.router.add_get("/temp/{filename}", self._handle_temp_file)
 
     async def start(self):
         self._app = aio_web.Application(middlewares=[self._auth_middleware])
@@ -283,6 +299,27 @@ class WebBridge:
 
     def _log(self, level: str, action: str, **fields):
         self.plugin._log_behavior(level, action, **fields)
+
+    def get_video_url(self, file_path: str) -> str | None:
+        """给定本地文件路径，返回通过 WebBridge HTTP 可访问的 URL。
+        需要 video_serve_base_url 已配置。"""
+        if not self._video_serve_base_url:
+            return None
+        filename = os.path.basename(file_path)
+        return f"{self._video_serve_base_url}/temp/{filename}"
+
+    async def _handle_temp_file(self, request: aio_web.Request):
+        """提供 data/temp 目录下的文件，用于跨容器视频中转。"""
+        filename = request.match_info["filename"]
+        # 安全检查：只允许文件名，不允许路径穿越
+        if "/" in filename or "\\" in filename or ".." in filename:
+            return aio_web.Response(status=403, text="Forbidden")
+        # 在 AstrBot temp 目录查找
+        temp_dir = os.path.join("data", "temp")
+        file_path = os.path.join(temp_dir, filename)
+        if not os.path.isfile(file_path):
+            return aio_web.Response(status=404, text="File not found")
+        return aio_web.FileResponse(file_path)
 
     # ── Handlers ─────────────────────────────────────────
 
@@ -526,14 +563,19 @@ class AnonymousGroupPlugin(Star):
         # 从 schema 配置面板读取值
         cfg_port = 6196
         cfg_secret = ""
+        cfg_video_url = ""
         self._group_push_targets: list[dict] = []
         if config:
             cfg_port = config.get("web_bridge_port", 6196)
             cfg_secret = config.get("jwt_secret", "")
+            cfg_video_url = config.get("video_serve_base_url", "")
             raw_targets = config.get("group_push_targets", "")
             self._group_push_targets = self._parse_group_push_targets(raw_targets)
 
-        self.web_bridge = WebBridge(self, data_dir, port=cfg_port, jwt_secret=cfg_secret)
+        self.web_bridge = WebBridge(
+            self, data_dir, port=cfg_port, jwt_secret=cfg_secret,
+            video_serve_base_url=cfg_video_url,
+        )
 
         # 如果面板里 jwt_secret 留空，将自动生成的值回写到配置面板
         if config and not cfg_secret:
@@ -552,6 +594,18 @@ class AnonymousGroupPlugin(Star):
 
     async def initialize(self):
         """插件激活时启动 WebBridge HTTP server。"""
+        if not HAS_PIL:
+            self._log_behavior(
+                "warning", "pillow_not_available",
+                hint="Pillow 库未安装，Telegram 贴纸（WebP）将无法自动转换为 PNG。"
+                     "请运行: pip install Pillow>=9.0.0",
+            )
+        if not self.web_bridge._video_serve_base_url:
+            self._log_behavior(
+                "warning", "video_serve_not_configured",
+                hint="video_serve_base_url 未配置，跨容器视频中转可能失败。"
+                     "请在插件配置中设置（如 http://astrbot:6196）",
+            )
         self._server_task = asyncio.create_task(self._run_web_bridge())
 
     async def _run_web_bridge(self):
@@ -1122,14 +1176,29 @@ class AnonymousGroupPlugin(Star):
                         sender=sender_id,
                         file_path=str(file_path),
                     )
-                    chains.append([Comp.Video.fromFileSystem(path=file_path)])
+                    # 优先通过 HTTP URL 提供视频（解决跨容器路径不可达问题）
+                    video_url = self.web_bridge.get_video_url(file_path)
+                    if video_url:
+                        self._log_behavior(
+                            "info",
+                            "video_served_via_http",
+                            sender=sender_id,
+                            url=video_url,
+                        )
+                        chains.append([Comp.Video(file=video_url)])
+                    else:
+                        chains.append([Comp.Video.fromFileSystem(path=file_path)])
                 except Exception as e:
                     # 尝试在 AstrBot temp 目录搜索 OB11 裸文件名
                     resolved = self._try_resolve_ob11_video(
                         getattr(comp, "file", ""), sender_id
                     )
                     if resolved:
-                        chains.append([Comp.Video.fromFileSystem(path=resolved)])
+                        video_url = self.web_bridge.get_video_url(resolved)
+                        if video_url:
+                            chains.append([Comp.Video(file=video_url)])
+                        else:
+                            chains.append([Comp.Video.fromFileSystem(path=resolved)])
                     else:
                         url = getattr(comp, "url", None) or getattr(comp, "file", "")
                         if url and str(url).startswith("http"):
@@ -1139,7 +1208,7 @@ class AnonymousGroupPlugin(Star):
                                 sender=sender_id,
                                 url=str(url)[:120],
                             )
-                            chains.append([Comp.Video(url=str(url))])
+                            chains.append([Comp.Video(file=str(url))])
                         else:
                             self._log_behavior(
                                 "warning",
